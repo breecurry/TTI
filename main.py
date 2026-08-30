@@ -370,121 +370,417 @@ async def sync_one_bill(
             )
 
 
-async def run_scan() -> dict:
+async def run_scan():
+
+    # Never allow two batches to run at once.
     if bot.scan_lock.locked():
-        return {"status": "already running"}
+        return {
+            "status": "busy"
+        }
 
     async with bot.scan_lock:
+
+        log.info("Starting Tennessee legislative batch.")
+
         async with new_client() as client:
-            general_assembly, discovered = await discover_current_bills(client)
 
-            # A zero-result discovery must never be treated as a successful baseline.
-            if not discovered:
-                raise RuntimeError(
-                    "The official Tennessee index returned zero discoverable bills."
-                )
+            current_ga = CURRENT_GA
 
-            existing_before = await bot.db.fetchval(
-                "SELECT COUNT(*) FROM bills WHERE general_assembly=$1",
-                general_assembly,
+            # -------------------------------------------------
+            # DISCOVER CURRENT GENERAL ASSEMBLY
+            # -------------------------------------------------
+
+            current_discovered = await discover_bills_for_ga(
+                client,
+                current_ga,
             )
 
-            is_baselined = await baseline_complete(bot.db, general_assembly)
+            newly_discovered = await save_discovered_bills(
+                current_ga,
+                current_discovered,
+            )
 
-            # Repair the bad state produced by the earlier zero-bill scan.
-            if is_baselined and existing_before == 0:
-                await set_setting(
+            log.info(
+                "Current Tennessee index contains %s bills.",
+                len(current_discovered),
+            )
+
+            # -------------------------------------------------
+            # DISCOVER HISTORICAL GENERAL ASSEMBLIES
+            #
+            # Only do this once for each historical GA.
+            # These sessions are finished, so their bill list
+            # isn't going to keep changing.
+            # -------------------------------------------------
+
+            for ga in reversed(TRACKED_GAS):
+
+                if ga == current_ga:
+                    continue
+
+                existing_count = await bot.db.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM bills
+                    WHERE general_assembly=$1
+                    """,
+                    ga,
+                )
+
+                if existing_count > 0:
+                    continue
+
+                try:
+
+                    historical_bills = await discover_bills_for_ga(
+                        client,
+                        ga,
+                    )
+
+                    await save_discovered_bills(
+                        ga,
+                        historical_bills,
+                    )
+
+                    log.info(
+                        "Discovered %s bills for Tennessee GA %s.",
+                        len(historical_bills),
+                        ga,
+                    )
+
+                except Exception:
+
+                    log.exception(
+                        "Historical discovery failed for GA %s.",
+                        ga,
+                    )
+
+            # -------------------------------------------------
+            # FIX ANY BAD OLD BASELINE FLAGS
+            # -------------------------------------------------
+
+            baseline_cache = {}
+
+            for ga in TRACKED_GAS:
+
+                total = await bot.db.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM bills
+                    WHERE general_assembly=$1
+                    """,
+                    ga,
+                )
+
+                unseeded = await bot.db.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM bills
+                    WHERE
+                        general_assembly=$1
+                        AND seeded=FALSE
+                    """,
+                    ga,
+                )
+
+                is_complete = await baseline_complete(
                     bot.db,
-                    setting_key(general_assembly),
-                    "false",
+                    ga,
                 )
-                is_baselined = False
 
-            inserted = await save_discovered_bills(
-                general_assembly,
-                discovered,
-            )
+                # A previous broken run may have marked
+                # an empty/incomplete GA as finished.
+                if (
+                    total > 0
+                    and unseeded > 0
+                    and is_complete
+                ):
 
-            rows = await bot.db.fetch(
+                    await set_setting(
+                        bot.db,
+                        setting_key(ga),
+                        "false",
+                    )
+
+                    is_complete = False
+
+                baseline_cache[ga] = is_complete
+
+            # -------------------------------------------------
+            # CURRENT GA GETS FIRST PRIORITY
+            # -------------------------------------------------
+
+            current_unseeded = await bot.db.fetchval(
                 """
-                SELECT
-                    id,
-                    general_assembly,
-                    bill_number,
-                    official_url,
-                    seeded
+                SELECT COUNT(*)
                 FROM bills
-                WHERE general_assembly=$1
-                ORDER BY
-                    seeded ASC,
-                    last_checked_at ASC NULLS FIRST,
-                    bill_number ASC
-                LIMIT $2
+                WHERE
+                    general_assembly=$1
+                    AND seeded=FALSE
                 """,
-                general_assembly,
-                BILLS_PER_CYCLE,
+                current_ga,
             )
+
+            rows = []
+
+            if current_unseeded > 0:
+
+                # Finish current Tennessee legislature first.
+
+                rows = await bot.db.fetch(
+                    """
+                    SELECT
+                        id,
+                        general_assembly,
+                        bill_number,
+                        official_url,
+                        seeded
+                    FROM bills
+                    WHERE
+                        general_assembly=$1
+                        AND seeded=FALSE
+                    ORDER BY
+                        last_checked_at ASC NULLS FIRST,
+                        bill_number ASC
+                    LIMIT $2
+                    """,
+                    current_ga,
+                    BILLS_PER_CYCLE,
+                )
+
+            else:
+
+                # -------------------------------------------------
+                # CURRENT SESSION REFRESH
+                # -------------------------------------------------
+
+                current_rows = await bot.db.fetch(
+                    """
+                    SELECT
+                        id,
+                        general_assembly,
+                        bill_number,
+                        official_url,
+                        seeded
+                    FROM bills
+                    WHERE
+                        general_assembly=$1
+                        AND seeded=TRUE
+                    ORDER BY
+                        last_checked_at ASC NULLS FIRST,
+                        bill_number ASC
+                    LIMIT $2
+                    """,
+                    current_ga,
+                    CURRENT_REFRESH_BATCH,
+                )
+
+                # -------------------------------------------------
+                # HISTORICAL BACKFILL
+                # -------------------------------------------------
+
+                history_rows = await bot.db.fetch(
+                    """
+                    SELECT
+                        id,
+                        general_assembly,
+                        bill_number,
+                        official_url,
+                        seeded
+                    FROM bills
+                    WHERE
+                        general_assembly <> $1
+                        AND seeded=FALSE
+                    ORDER BY
+                        general_assembly DESC,
+                        last_checked_at ASC NULLS FIRST,
+                        bill_number ASC
+                    LIMIT $2
+                    """,
+                    current_ga,
+                    HISTORY_BACKFILL_BATCH,
+                )
+
+                rows = (
+                    list(current_rows)
+                    + list(history_rows)
+                )
+
+            # -------------------------------------------------
+            # PROCESS THIS SMALL BATCH
+            # -------------------------------------------------
 
             semaphore = asyncio.Semaphore(2)
 
             async def worker(row):
+
                 async with semaphore:
-                    await sync_one_bill(
-                        client,
-                        row,
-                        current_baseline_complete=is_baselined,
+
+                    ga = row["general_assembly"]
+
+                    try:
+
+                        await sync_one_bill(
+                            client,
+                            row,
+                            current_baseline_complete=(
+                                baseline_cache.get(
+                                    ga,
+                                    False,
+                                )
+                            ),
+                        )
+
+                    except Exception:
+
+                        log.exception(
+                            "Unexpected error processing %s.",
+                            row["bill_number"],
+                        )
+
+                    # Be polite to Tennessee's server.
+                    await asyncio.sleep(0.25)
+
+            results = await asyncio.gather(
+                *[
+                    worker(row)
+                    for row in rows
+                ],
+                return_exceptions=True,
+            )
+
+            for result in results:
+
+                if isinstance(
+                    result,
+                    Exception,
+                ):
+
+                    log.error(
+                        "Batch worker failed: %s",
+                        result,
                     )
-                    await asyncio.sleep(0.20)
 
-            await asyncio.gather(*(worker(row) for row in rows))
+            # -------------------------------------------------
+            # CHECK WHICH GENERAL ASSEMBLIES ARE FINISHED
+            # -------------------------------------------------
 
-            unseeded = await bot.db.fetchval(
+            for ga in TRACKED_GAS:
+
+                total = await bot.db.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM bills
+                    WHERE general_assembly=$1
+                    """,
+                    ga,
+                )
+
+                if total == 0:
+                    continue
+
+                remaining = await bot.db.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM bills
+                    WHERE
+                        general_assembly=$1
+                        AND seeded=FALSE
+                    """,
+                    ga,
+                )
+
+                if (
+                    remaining == 0
+                    and not await baseline_complete(
+                        bot.db,
+                        ga,
+                    )
+                ):
+
+                    await set_setting(
+                        bot.db,
+                        setting_key(ga),
+                        "true",
+                    )
+
+                    log.info(
+                        "Baseline complete for Tennessee GA %s.",
+                        ga,
+                    )
+
+                    # Only announce completion of the
+                    # CURRENT legislature in Discord.
+                    if ga == current_ga:
+
+                        embed = discord.Embed(
+                            title=(
+                                "✅ Current Tennessee "
+                                "legislative index complete"
+                            ),
+                            description=(
+                                "The current General Assembly "
+                                "has been indexed. Future official "
+                                "changes will generate alerts."
+                            ),
+                        )
+
+                        await send_to_alert_channels(
+                            bot,
+                            embed,
+                        )
+
+            # -------------------------------------------------
+            # RETURN CLEAN PROGRESS DATA
+            # -------------------------------------------------
+
+            current_total = await bot.db.fetchval(
                 """
                 SELECT COUNT(*)
                 FROM bills
-                WHERE general_assembly=$1 AND seeded=FALSE
+                WHERE general_assembly=$1
                 """,
-                general_assembly,
+                current_ga,
             )
 
-            indexed = await bot.db.fetchval(
+            current_indexed = await bot.db.fetchval(
                 """
                 SELECT COUNT(*)
                 FROM bills
-                WHERE general_assembly=$1 AND seeded=TRUE
+                WHERE
+                    general_assembly=$1
+                    AND seeded=TRUE
                 """,
-                general_assembly,
+                current_ga,
             )
 
-            if not is_baselined and unseeded == 0 and len(discovered) > 0:
-                await set_setting(
-                    bot.db,
-                    setting_key(general_assembly),
-                    "true",
-                )
-                is_baselined = True
+            historical_remaining = await bot.db.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM bills
+                WHERE
+                    general_assembly <> $1
+                    AND seeded=FALSE
+                """,
+                current_ga,
+            )
 
-                embed = discord.Embed(
-                    title="✅ Tennessee legislative index ready",
-                    description=(
-                        f"All {len(discovered):,} regular-session House and Senate bills "
-                        f"from the {general_assembly}th General Assembly are indexed. "
-                        "Future official changes will generate alerts automatically."
-                    ),
-                )
-                await send_to_alert_channels(bot, embed)
-
-            return {
+            result = {
                 "status": "ok",
-                "general_assembly": general_assembly,
-                "discovered": len(discovered),
-                "new_bills": inserted,
-                "indexed": indexed,
-                "checked_this_run": len(rows),
-                "remaining": unseeded,
-                "baseline_complete": is_baselined,
+                "current_ga": current_ga,
+                "current_total": current_total,
+                "current_indexed": current_indexed,
+                "historical_remaining": historical_remaining,
+                "processed_this_batch": len(rows),
+                "new_current_bills": newly_discovered,
             }
 
+            log.info(
+                "Tennessee legislative batch complete: %s",
+                result,
+            )
+
+            return result
 
 @tasks.loop(minutes=5)
 async def legislative_watch():
