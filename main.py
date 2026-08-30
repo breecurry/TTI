@@ -33,7 +33,7 @@ AI_MODEL = os.getenv("AI_MODEL", "gpt-5.6-luna")
 # A rolling sweep of the official Tennessee site.
 # 1,000 bills per cycle means a full 5,000-6,000 bill session is normally
 # rechecked roughly every 30-40 minutes without hammering the state site.
-BILLS_PER_CYCLE = int(os.getenv("BILLS_PER_CYCLE", "1000"))
+BILLS_PER_CYCLE = int(os.getenv("BILLS_PER_CYCLE", "500"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS guild_config (
@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS bills (
     id BIGSERIAL PRIMARY KEY,
     general_assembly INTEGER NOT NULL,
     bill_number TEXT NOT NULL,
-    official_url TEXT,
+    official_url TEXT NOT NULL,
     caption TEXT,
     page_text TEXT,
     latest_action TEXT,
@@ -64,62 +64,17 @@ CREATE TABLE IF NOT EXISTS bills (
     UNIQUE (general_assembly, bill_number)
 );
 
-ALTER TABLE bills
-ADD COLUMN IF NOT EXISTS page_text TEXT;
-
-ALTER TABLE bills
-ADD COLUMN IF NOT EXISTS seeded BOOLEAN NOT NULL DEFAULT FALSE;
-
-ALTER TABLE bills
-ADD COLUMN IF NOT EXISTS discovered_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
-
-ALTER TABLE bills
-ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ;
-
-ALTER TABLE bills
-ADD COLUMN IF NOT EXISTS latest_action TEXT;
-
-ALTER TABLE bills
-ADD COLUMN IF NOT EXISTS latest_action_date DATE;
-
-ALTER TABLE bills
-ADD COLUMN IF NOT EXISTS caption TEXT;
-
-ALTER TABLE bills
-ADD COLUMN IF NOT EXISTS official_url TEXT;
-
-ALTER TABLE bills
-ALTER COLUMN last_action_date
-TYPE DATE
-USING last_action_date::date;
-
-
 CREATE TABLE IF NOT EXISTS bill_events (
     id BIGSERIAL PRIMARY KEY,
     bill_id BIGINT NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
     event_key TEXT NOT NULL UNIQUE,
     action TEXT NOT NULL,
-    action_date_text TEXT,
+    action_date_text TEXT NOT NULL,
     action_date DATE,
     scheduled_for DATE,
-    category TEXT NOT NULL DEFAULT 'UPDATE',
+    category TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
-ALTER TABLE bill_events
-ADD COLUMN IF NOT EXISTS action_date_text TEXT;
-
-ALTER TABLE bill_events
-ADD COLUMN IF NOT EXISTS scheduled_for DATE;
-
-ALTER TABLE bill_events
-ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'UPDATE';
-
-ALTER TABLE bill_events
-ALTER COLUMN action_date
-TYPE DATE
-USING action_date::date;
-
 
 CREATE INDEX IF NOT EXISTS idx_bills_ga_number
 ON bills (general_assembly, bill_number);
@@ -417,10 +372,34 @@ async def run_scan() -> dict:
 
     async with bot.scan_lock:
         async with new_client() as client:
-            ga, discovered = await discover_current_bills(client)
+            general_assembly, discovered = await discover_current_bills(client)
 
-            inserted = await save_discovered_bills(ga, discovered)
-            is_baselined = await baseline_complete(bot.db, ga)
+            # A zero-result discovery must never be treated as a successful baseline.
+            if not discovered:
+                raise RuntimeError(
+                    "The official Tennessee index returned zero discoverable bills."
+                )
+
+            existing_before = await bot.db.fetchval(
+                "SELECT COUNT(*) FROM bills WHERE general_assembly=$1",
+                general_assembly,
+            )
+
+            is_baselined = await baseline_complete(bot.db, general_assembly)
+
+            # Repair the bad state produced by the earlier zero-bill scan.
+            if is_baselined and existing_before == 0:
+                await set_setting(
+                    bot.db,
+                    setting_key(general_assembly),
+                    "false",
+                )
+                is_baselined = False
+
+            inserted = await save_discovered_bills(
+                general_assembly,
+                discovered,
+            )
 
             rows = await bot.db.fetch(
                 """
@@ -438,7 +417,7 @@ async def run_scan() -> dict:
                     bill_number ASC
                 LIMIT $2
                 """,
-                ga,
+                general_assembly,
                 BILLS_PER_CYCLE,
             )
 
@@ -451,8 +430,7 @@ async def run_scan() -> dict:
                         row,
                         current_baseline_complete=is_baselined,
                     )
-                    # Keeps request pressure modest on the state site.
-                    await asyncio.sleep(0.30)
+                    await asyncio.sleep(0.20)
 
             await asyncio.gather(*(worker(row) for row in rows))
 
@@ -462,29 +440,44 @@ async def run_scan() -> dict:
                 FROM bills
                 WHERE general_assembly=$1 AND seeded=FALSE
                 """,
-                ga,
+                general_assembly,
             )
 
-            if not is_baselined and unseeded == 0:
-                await set_setting(bot.db, setting_key(ga), "true")
+            indexed = await bot.db.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM bills
+                WHERE general_assembly=$1 AND seeded=TRUE
+                """,
+                general_assembly,
+            )
+
+            if not is_baselined and unseeded == 0 and len(discovered) > 0:
+                await set_setting(
+                    bot.db,
+                    setting_key(general_assembly),
+                    "true",
+                )
                 is_baselined = True
 
                 embed = discord.Embed(
-                    title="✅ Tennessee legislative baseline complete",
+                    title="✅ Tennessee legislative index ready",
                     description=(
-                        f"The {ga}th General Assembly has been indexed. "
-                        "Future official changes will now generate alerts automatically."
+                        f"All {len(discovered):,} regular-session House and Senate bills "
+                        f"from the {general_assembly}th General Assembly are indexed. "
+                        "Future official changes will generate alerts automatically."
                     ),
                 )
                 await send_to_alert_channels(bot, embed)
 
             return {
                 "status": "ok",
-                "ga": ga,
+                "general_assembly": general_assembly,
                 "discovered": len(discovered),
                 "new_bills": inserted,
-                "checked": len(rows),
-                "remaining_baseline": unseeded,
+                "indexed": indexed,
+                "checked_this_run": len(rows),
+                "remaining": unseeded,
                 "baseline_complete": is_baselined,
             }
 
@@ -539,36 +532,64 @@ async def setalerts(interaction: discord.Interaction):
 async def status(interaction: discord.Interaction):
     await interaction.response.defer()
 
-    ga = await bot.db.fetchval(
+    general_assembly = await bot.db.fetchval(
         "SELECT MAX(general_assembly) FROM bills"
     )
-    if not ga:
-        await interaction.followup.send(
-            "The first Tennessee index scan has not completed yet."
+    if not general_assembly:
+        embed = discord.Embed(
+            title="🏛️ TTI Legislative Desk",
+            description=(
+                "The Tennessee bill index has not populated yet. "
+                "The watcher will retry automatically, or an administrator can run `/scan`."
+            ),
         )
+        await interaction.followup.send(embed=embed)
         return
 
     total = await bot.db.fetchval(
         "SELECT COUNT(*) FROM bills WHERE general_assembly=$1",
-        ga,
+        general_assembly,
     )
-    seeded = await bot.db.fetchval(
+    indexed = await bot.db.fetchval(
         "SELECT COUNT(*) FROM bills WHERE general_assembly=$1 AND seeded=TRUE",
-        ga,
+        general_assembly,
     )
     last_checked = await bot.db.fetchval(
         "SELECT MAX(last_checked_at) FROM bills WHERE general_assembly=$1",
-        ga,
+        general_assembly,
     )
+    complete = await baseline_complete(bot.db, general_assembly)
 
-    await interaction.followup.send(
-        f"🏛️ **TTI Legislative Desk**\n"
-        f"General Assembly: **{ga}**\n"
-        f"Bills discovered: **{total:,}**\n"
-        f"Bills indexed: **{seeded:,}**\n"
-        f"Baseline: **{'complete' if await baseline_complete(bot.db, ga) else 'building'}**\n"
-        f"Latest check: `{last_checked}`"
+    percent = (indexed / total * 100) if total else 0
+
+    embed = discord.Embed(
+        title="🏛️ Tennessee Legislative Monitor",
+        description=f"**{general_assembly}th General Assembly (2025–2026)**",
     )
+    embed.add_field(
+        name="Bills found",
+        value=f"{total:,}",
+        inline=True,
+    )
+    embed.add_field(
+        name="Fully indexed",
+        value=f"{indexed:,} ({percent:.1f}%)",
+        inline=True,
+    )
+    embed.add_field(
+        name="Initial index",
+        value="✅ Complete" if complete else "⏳ Building",
+        inline=True,
+    )
+    embed.add_field(
+        name="Last official-site check",
+        value=str(last_checked) if last_checked else "Starting now",
+        inline=False,
+    )
+    embed.set_footer(
+        text="Source: Tennessee General Assembly official legislative records"
+    )
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(
@@ -915,16 +936,64 @@ Do not invent vote totals, dates, sponsors, motives, or legal effects.
 
 @bot.tree.command(
     name="scan",
-    description="Run the Tennessee legislative watcher now.",
+    description="Check Tennessee's official legislative index now.",
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def scan(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True, ephemeral=True)
-    result = await run_scan()
-    await interaction.followup.send(
-        f"Scan result: `{result}`",
-        ephemeral=True,
+
+    try:
+        result = await run_scan()
+    except Exception as exc:
+        log.exception("Manual Tennessee legislative scan failed.")
+        await interaction.followup.send(
+            "🔴 **The Tennessee scan failed.**\n"
+            f"`{type(exc).__name__}: {exc}`",
+            ephemeral=True,
+        )
+        return
+
+    if result.get("status") == "already running":
+        await interaction.followup.send(
+            "⏳ A Tennessee legislative scan is already running.",
+            ephemeral=True,
+        )
+        return
+
+    general_assembly = result["general_assembly"]
+    embed = discord.Embed(
+        title="✅ Tennessee legislative scan finished",
+        description=f"**{general_assembly}th General Assembly (2025–2026)**",
     )
+    embed.add_field(
+        name="Bills found on official index",
+        value=f"{result['discovered']:,}",
+        inline=True,
+    )
+    embed.add_field(
+        name="Indexed so far",
+        value=f"{result['indexed']:,}",
+        inline=True,
+    )
+    embed.add_field(
+        name="Checked this run",
+        value=f"{result['checked_this_run']:,}",
+        inline=True,
+    )
+    embed.add_field(
+        name="Still to index",
+        value=f"{result['remaining']:,}",
+        inline=True,
+    )
+    embed.add_field(
+        name="Initial index",
+        value="✅ Complete" if result["baseline_complete"] else "⏳ Building",
+        inline=True,
+    )
+    embed.set_footer(
+        text="Official source: Tennessee General Assembly"
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(
