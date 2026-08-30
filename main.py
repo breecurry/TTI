@@ -1,62 +1,66 @@
 import asyncio
 import logging
 import os
-import sys
+import re
+from datetime import date
 
 import asyncpg
 import discord
 from discord import app_commands
-from discord.ext import commands
-from collector import sync_bill
+from discord.ext import commands, tasks
+from openai import AsyncOpenAI
 
+from tn_legislation import (
+    BillEvent,
+    discover_current_bills,
+    fetch_bill,
+    new_client,
+    normalize_bill_number,
+)
 
-# ---------------------------------------------------------
-# Logging
-# ---------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-
 log = logging.getLogger("tti")
 
+DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
+DATABASE_URL = os.environ["DATABASE_URL"]
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+AI_MODEL = os.getenv("AI_MODEL", "gpt-5.6-luna")
 
-# ---------------------------------------------------------
-# Environment variables
-# ---------------------------------------------------------
+# A rolling sweep of the official Tennessee site.
+# 1,000 bills per cycle means a full 5,000-6,000 bill session is normally
+# rechecked roughly every 30-40 minutes without hammering the state site.
+BILLS_PER_CYCLE = int(os.getenv("BILLS_PER_CYCLE", "1000"))
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS guild_config (
+    guild_id BIGINT PRIMARY KEY,
+    alert_channel_id BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
-if not DISCORD_TOKEN:
-    log.error("DISCORD_TOKEN is missing.")
-    sys.exit(1)
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
-if not DATABASE_URL:
-    log.error("DATABASE_URL is missing.")
-    sys.exit(1)
-
-
-# ---------------------------------------------------------
-# Database
-# ---------------------------------------------------------
-
-CREATE_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS bills (
     id BIGSERIAL PRIMARY KEY,
     general_assembly INTEGER NOT NULL,
-    bill_number VARCHAR(20) NOT NULL,
-    chamber VARCHAR(20),
-    title TEXT,
+    bill_number TEXT NOT NULL,
+    official_url TEXT NOT NULL,
     caption TEXT,
-    status TEXT,
-    official_url TEXT,
-    last_action TEXT,
-    last_action_date TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    page_text TEXT,
+    latest_action TEXT,
+    latest_action_date DATE,
+    seeded BOOLEAN NOT NULL DEFAULT FALSE,
+    discovered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_checked_at TIMESTAMPTZ,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
     UNIQUE (general_assembly, bill_number)
 );
 
@@ -64,369 +68,829 @@ CREATE TABLE IF NOT EXISTS bill_events (
     id BIGSERIAL PRIMARY KEY,
     bill_id BIGINT NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
     event_key TEXT NOT NULL UNIQUE,
-    action_date TIMESTAMPTZ,
     action TEXT NOT NULL,
-    source_url TEXT,
-    raw_data JSONB,
+    action_date_text TEXT NOT NULL,
+    action_date DATE,
+    scheduled_for DATE,
+    category TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS watched_bills (
-    id BIGSERIAL PRIMARY KEY,
-    discord_user_id BIGINT NOT NULL,
-    bill_id BIGINT NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+CREATE INDEX IF NOT EXISTS idx_bills_ga_number
+ON bills (general_assembly, bill_number);
 
-    UNIQUE (discord_user_id, bill_id)
+CREATE INDEX IF NOT EXISTS idx_bills_checked
+ON bills (general_assembly, last_checked_at);
+
+CREATE INDEX IF NOT EXISTS idx_events_bill
+ON bill_events (bill_id, action_date DESC);
+
+CREATE INDEX IF NOT EXISTS idx_events_schedule
+ON bill_events (scheduled_for);
+
+CREATE INDEX IF NOT EXISTS idx_bills_search
+ON bills USING GIN (
+    to_tsvector(
+        'english',
+        COALESCE(bill_number, '') || ' ' ||
+        COALESCE(caption, '') || ' ' ||
+        COALESCE(page_text, '')
+    )
 );
-
-CREATE INDEX IF NOT EXISTS idx_bills_bill_number
-ON bills (bill_number);
-
-CREATE INDEX IF NOT EXISTS idx_bill_events_bill_id
-ON bill_events (bill_id);
-
-CREATE INDEX IF NOT EXISTS idx_bill_events_action_date
-ON bill_events (action_date);
 """
 
 
-async def create_database_pool():
-    for attempt in range(1, 11):
+def setting_key(ga: int) -> str:
+    return f"baseline_complete:{ga}"
+
+
+async def get_setting(pool, key: str) -> str | None:
+    return await pool.fetchval(
+        "SELECT value FROM app_settings WHERE key=$1",
+        key,
+    )
+
+
+async def set_setting(pool, key: str, value: str):
+    await pool.execute(
+        """
+        INSERT INTO app_settings (key, value, updated_at)
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (key)
+        DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+        """,
+        key,
+        value,
+    )
+
+
+async def baseline_complete(pool, ga: int) -> bool:
+    return (await get_setting(pool, setting_key(ga))) == "true"
+
+
+async def send_to_alert_channels(bot, embed: discord.Embed):
+    rows = await bot.db.fetch(
+        "SELECT guild_id, alert_channel_id FROM guild_config"
+    )
+
+    for row in rows:
+        channel = bot.get_channel(row["alert_channel_id"])
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(row["alert_channel_id"])
+            except Exception:
+                log.exception("Could not fetch configured alert channel.")
+                continue
+
         try:
-            pool = await asyncpg.create_pool(
-                DATABASE_URL,
-                min_size=1,
-                max_size=5,
-                command_timeout=30,
-            )
-
-            async with pool.acquire() as connection:
-                await connection.execute(CREATE_TABLES_SQL)
-
-            log.info("PostgreSQL connected and tables verified.")
-            return pool
-
-        except Exception as exc:
-            log.warning(
-                "Database connection attempt %s/10 failed: %s",
-                attempt,
-                exc,
-            )
-
-            if attempt == 10:
-                raise
-
-            await asyncio.sleep(5)
+            await channel.send(embed=embed)
+        except Exception:
+            log.exception("Could not send legislative alert.")
 
 
-# ---------------------------------------------------------
-# Discord bot
-# ---------------------------------------------------------
+def category_emoji(category: str) -> str:
+    return {
+        "FILED": "🆕",
+        "SCHEDULED": "🗓️",
+        "DEFERRED": "⏸️",
+        "AMENDED": "🟠",
+        "PASSED": "🟣",
+        "TO GOVERNOR": "📨",
+        "SIGNED": "🟢",
+        "VETOED": "🔴",
+        "WITHOUT SIGNATURE": "⚪",
+        "ENACTED": "✅",
+        "UPDATE": "🔵",
+    }.get(category, "🔵")
+
+
+def alert_embed(
+    bill_number: str,
+    ga: int,
+    official_url: str,
+    caption: str | None,
+    event: BillEvent,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"{category_emoji(event.category)} {event.category}: {bill_number}",
+        description=caption or "Tennessee legislative record updated.",
+        url=official_url,
+    )
+    embed.add_field(
+        name="Official action",
+        value=event.action[:1024],
+        inline=False,
+    )
+    embed.add_field(
+        name="Posted",
+        value=event.action_date_text,
+        inline=True,
+    )
+    if event.scheduled_for:
+        embed.add_field(
+            name="Scheduled for consideration",
+            value=event.scheduled_for.strftime("%B %d, %Y"),
+            inline=True,
+        )
+    embed.add_field(
+        name="Source",
+        value=f"[Tennessee General Assembly]({official_url})",
+        inline=False,
+    )
+    embed.set_footer(text=f"The Tennessee Independent • {ga}th General Assembly")
+    return embed
+
 
 class TTIBot(commands.Bot):
     def __init__(self):
-        intents = discord.Intents.default()
-
         super().__init__(
             command_prefix="!",
-            intents=intents,
+            intents=discord.Intents.default(),
         )
-
-        self.db = None
+        self.db: asyncpg.Pool | None = None
+        self.ai = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+        self.scan_lock = asyncio.Lock()
 
     async def setup_hook(self):
-        log.info("Connecting to PostgreSQL...")
-        self.db = await create_database_pool()
+        self.db = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=8,
+            command_timeout=45,
+        )
+        async with self.db.acquire() as conn:
+            await conn.execute(SCHEMA)
 
-        log.info("Synchronizing Discord slash commands...")
         synced = await self.tree.sync()
+        log.info("Synced %s Discord slash commands.", len(synced))
 
-        log.info("Synced %s slash commands.", len(synced))
+        if not legislative_watch.is_running():
+            legislative_watch.start()
 
     async def close(self):
+        if legislative_watch.is_running():
+            legislative_watch.cancel()
         if self.db:
             await self.db.close()
-
         await super().close()
 
 
 bot = TTIBot()
 
 
-# ---------------------------------------------------------
-# Events
-# ---------------------------------------------------------
-
 @bot.event
 async def on_ready():
-    log.info(
-        "TTI Legislative Desk is online as %s (ID: %s)",
-        bot.user,
-        bot.user.id,
+    log.info("TTI Legislative Desk online as %s", bot.user)
+
+
+async def save_discovered_bills(ga: int, discovered: dict[str, str]) -> int:
+    inserted = 0
+
+    async with bot.db.acquire() as conn:
+        for bill_number, official_url in discovered.items():
+            result = await conn.execute(
+                """
+                INSERT INTO bills (
+                    general_assembly,
+                    bill_number,
+                    official_url
+                )
+                VALUES ($1, $2, $3)
+                ON CONFLICT (general_assembly, bill_number)
+                DO UPDATE SET official_url=EXCLUDED.official_url
+                """,
+                ga,
+                bill_number,
+                official_url,
+            )
+            if result == "INSERT 0 1":
+                inserted += 1
+
+    return inserted
+
+
+async def sync_one_bill(
+    client,
+    bill_row,
+    *,
+    current_baseline_complete: bool,
+):
+    bill_id = bill_row["id"]
+    ga = bill_row["general_assembly"]
+    bill_number = bill_row["bill_number"]
+    was_seeded = bill_row["seeded"]
+
+    try:
+        page = await fetch_bill(
+            client,
+            bill_number,
+            ga,
+            bill_row["official_url"],
+        )
+    except Exception:
+        log.exception("Failed fetching %s", bill_number)
+        await bot.db.execute(
+            "UPDATE bills SET last_checked_at=NOW() WHERE id=$1",
+            bill_id,
+        )
+        return
+
+    new_events: list[BillEvent] = []
+
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                UPDATE bills
+                SET
+                    official_url=$2,
+                    caption=$3,
+                    page_text=$4,
+                    latest_action=$5,
+                    latest_action_date=$6,
+                    seeded=TRUE,
+                    last_checked_at=NOW(),
+                    updated_at=NOW()
+                WHERE id=$1
+                """,
+                bill_id,
+                page.official_url,
+                page.caption,
+                page.page_text,
+                page.latest_action,
+                page.latest_action_date,
+            )
+
+            # Oldest first so alerts read naturally if several changes appeared at once.
+            for event in reversed(page.events):
+                result = await conn.execute(
+                    """
+                    INSERT INTO bill_events (
+                        bill_id,
+                        event_key,
+                        action,
+                        action_date_text,
+                        action_date,
+                        scheduled_for,
+                        category
+                    )
+                    VALUES ($1,$2,$3,$4,$5,$6,$7)
+                    ON CONFLICT (event_key) DO NOTHING
+                    """,
+                    bill_id,
+                    event.event_key,
+                    event.action,
+                    event.action_date_text,
+                    event.action_date,
+                    event.scheduled_for,
+                    event.category,
+                )
+                if result == "INSERT 0 1":
+                    new_events.append(event)
+
+    # During the very first historical backfill we intentionally stay quiet.
+    # Once the baseline exists, a newly discovered bill IS news and gets alerts.
+    should_notify = current_baseline_complete or was_seeded
+
+    if should_notify:
+        for event in new_events:
+            await send_to_alert_channels(
+                bot,
+                alert_embed(
+                    bill_number,
+                    ga,
+                    page.official_url,
+                    page.caption,
+                    event,
+                ),
+            )
+
+
+async def run_scan() -> dict:
+    if bot.scan_lock.locked():
+        return {"status": "already running"}
+
+    async with bot.scan_lock:
+        async with new_client() as client:
+            ga, discovered = await discover_current_bills(client)
+
+            inserted = await save_discovered_bills(ga, discovered)
+            is_baselined = await baseline_complete(bot.db, ga)
+
+            rows = await bot.db.fetch(
+                """
+                SELECT
+                    id,
+                    general_assembly,
+                    bill_number,
+                    official_url,
+                    seeded
+                FROM bills
+                WHERE general_assembly=$1
+                ORDER BY
+                    seeded ASC,
+                    last_checked_at ASC NULLS FIRST,
+                    bill_number ASC
+                LIMIT $2
+                """,
+                ga,
+                BILLS_PER_CYCLE,
+            )
+
+            semaphore = asyncio.Semaphore(2)
+
+            async def worker(row):
+                async with semaphore:
+                    await sync_one_bill(
+                        client,
+                        row,
+                        current_baseline_complete=is_baselined,
+                    )
+                    # Keeps request pressure modest on the state site.
+                    await asyncio.sleep(0.30)
+
+            await asyncio.gather(*(worker(row) for row in rows))
+
+            unseeded = await bot.db.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM bills
+                WHERE general_assembly=$1 AND seeded=FALSE
+                """,
+                ga,
+            )
+
+            if not is_baselined and unseeded == 0:
+                await set_setting(bot.db, setting_key(ga), "true")
+                is_baselined = True
+
+                embed = discord.Embed(
+                    title="✅ Tennessee legislative baseline complete",
+                    description=(
+                        f"The {ga}th General Assembly has been indexed. "
+                        "Future official changes will now generate alerts automatically."
+                    ),
+                )
+                await send_to_alert_channels(bot, embed)
+
+            return {
+                "status": "ok",
+                "ga": ga,
+                "discovered": len(discovered),
+                "new_bills": inserted,
+                "checked": len(rows),
+                "remaining_baseline": unseeded,
+                "baseline_complete": is_baselined,
+            }
+
+
+@tasks.loop(minutes=5)
+async def legislative_watch():
+    try:
+        result = await run_scan()
+        log.info("Legislative scan: %s", result)
+    except Exception:
+        log.exception("Legislative watcher cycle failed.")
+
+
+@legislative_watch.before_loop
+async def before_legislative_watch():
+    await bot.wait_until_ready()
+
+
+@bot.tree.command(
+    name="setalerts",
+    description="Send automatic Tennessee legislative alerts to this channel.",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setalerts(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "Run this inside the TTI Discord server.",
+            ephemeral=True,
+        )
+        return
+
+    await bot.db.execute(
+        """
+        INSERT INTO guild_config (guild_id, alert_channel_id, updated_at)
+        VALUES ($1,$2,NOW())
+        ON CONFLICT (guild_id)
+        DO UPDATE SET alert_channel_id=EXCLUDED.alert_channel_id, updated_at=NOW()
+        """,
+        interaction.guild.id,
+        interaction.channel_id,
+    )
+
+    await interaction.response.send_message(
+        "✅ Automatic Tennessee legislative alerts will post in this channel."
     )
 
 
-# ---------------------------------------------------------
-# /ping
-# ---------------------------------------------------------
+@bot.tree.command(
+    name="status",
+    description="Show the Tennessee legislative monitor status.",
+)
+async def status(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    ga = await bot.db.fetchval(
+        "SELECT MAX(general_assembly) FROM bills"
+    )
+    if not ga:
+        await interaction.followup.send(
+            "The first Tennessee index scan has not completed yet."
+        )
+        return
+
+    total = await bot.db.fetchval(
+        "SELECT COUNT(*) FROM bills WHERE general_assembly=$1",
+        ga,
+    )
+    seeded = await bot.db.fetchval(
+        "SELECT COUNT(*) FROM bills WHERE general_assembly=$1 AND seeded=TRUE",
+        ga,
+    )
+    last_checked = await bot.db.fetchval(
+        "SELECT MAX(last_checked_at) FROM bills WHERE general_assembly=$1",
+        ga,
+    )
+
+    await interaction.followup.send(
+        f"🏛️ **TTI Legislative Desk**\n"
+        f"General Assembly: **{ga}**\n"
+        f"Bills discovered: **{total:,}**\n"
+        f"Bills indexed: **{seeded:,}**\n"
+        f"Baseline: **{'complete' if await baseline_complete(bot.db, ga) else 'building'}**\n"
+        f"Latest check: `{last_checked}`"
+    )
+
+
+@bot.tree.command(
+    name="bill",
+    description="Look up a Tennessee bill from the official legislative record.",
+)
+@app_commands.describe(bill_number="Example: HB1882")
+async def bill(interaction: discord.Interaction, bill_number: str):
+    number = normalize_bill_number(bill_number)
+
+    row = await bot.db.fetchrow(
+        """
+        SELECT *
+        FROM bills
+        WHERE bill_number=$1
+        ORDER BY general_assembly DESC
+        LIMIT 1
+        """,
+        number,
+    )
+
+    if not row:
+        await interaction.response.send_message(
+            f"I don't have **{number}** indexed yet.",
+            ephemeral=True,
+        )
+        return
+
+    events = await bot.db.fetch(
+        """
+        SELECT action, action_date_text, category
+        FROM bill_events
+        WHERE bill_id=$1
+        ORDER BY action_date DESC NULLS LAST, id DESC
+        LIMIT 5
+        """,
+        row["id"],
+    )
+
+    embed = discord.Embed(
+        title=f"{number} • {row['general_assembly']}th General Assembly",
+        description=row["caption"] or "No caption available.",
+        url=row["official_url"],
+    )
+
+    if row["latest_action"]:
+        embed.add_field(
+            name="Latest official action",
+            value=row["latest_action"][:1024],
+            inline=False,
+        )
+
+    if events:
+        history = "\n".join(
+            f"**{e['action_date_text']}** — {e['action']}"
+            for e in events
+        )
+        embed.add_field(
+            name="Recent history",
+            value=history[:1024],
+            inline=False,
+        )
+
+    embed.add_field(
+        name="Official source",
+        value=f"[Tennessee General Assembly]({row['official_url']})",
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="search",
+    description="Search Tennessee legislation by topic or phrase.",
+)
+@app_commands.describe(query="Example: hemp, property tax, school vouchers")
+async def search(interaction: discord.Interaction, query: str):
+    await interaction.response.defer()
+
+    rows = await bot.db.fetch(
+        """
+        WITH q AS (
+            SELECT websearch_to_tsquery('english', $1) AS query
+        )
+        SELECT
+            bill_number,
+            general_assembly,
+            caption,
+            latest_action,
+            official_url,
+            ts_rank_cd(
+                to_tsvector(
+                    'english',
+                    COALESCE(bill_number,'') || ' ' ||
+                    COALESCE(caption,'') || ' ' ||
+                    COALESCE(page_text,'')
+                ),
+                q.query
+            ) AS rank
+        FROM bills, q
+        WHERE
+            to_tsvector(
+                'english',
+                COALESCE(bill_number,'') || ' ' ||
+                COALESCE(caption,'') || ' ' ||
+                COALESCE(page_text,'')
+            ) @@ q.query
+            OR bill_number ILIKE '%' || $1 || '%'
+        ORDER BY rank DESC, latest_action_date DESC NULLS LAST
+        LIMIT 10
+        """,
+        query,
+    )
+
+    if not rows:
+        await interaction.followup.send(
+            f"No indexed Tennessee bills matched **{query}**."
+        )
+        return
+
+    lines = []
+    for row in rows:
+        caption = (row["caption"] or "No caption").replace("\n", " ")
+        if len(caption) > 220:
+            caption = caption[:217] + "..."
+        lines.append(
+            f"**[{row['bill_number']}]({row['official_url']})** — {caption}"
+        )
+
+    await interaction.followup.send("\n\n".join(lines)[:4000])
+
+
+@bot.tree.command(
+    name="upcoming",
+    description="Show bills officially scheduled for upcoming consideration.",
+)
+@app_commands.describe(days="How many days ahead to show, 1-30")
+async def upcoming(interaction: discord.Interaction, days: app_commands.Range[int, 1, 30] = 7):
+    rows = await bot.db.fetch(
+        """
+        SELECT DISTINCT ON (b.bill_number, e.scheduled_for)
+            b.bill_number,
+            b.caption,
+            b.official_url,
+            e.action,
+            e.scheduled_for
+        FROM bill_events e
+        JOIN bills b ON b.id=e.bill_id
+        WHERE
+            e.scheduled_for >= CURRENT_DATE
+            AND e.scheduled_for <= CURRENT_DATE + $1::int
+        ORDER BY
+            b.bill_number,
+            e.scheduled_for,
+            e.id DESC
+        LIMIT 30
+        """,
+        days,
+    )
+
+    if not rows:
+        await interaction.response.send_message(
+            f"No indexed bills are currently shown as scheduled in the next {days} days."
+        )
+        return
+
+    rows = sorted(rows, key=lambda r: (r["scheduled_for"], r["bill_number"]))
+    lines = [
+        f"**{r['scheduled_for'].strftime('%b %d')} — "
+        f"[{r['bill_number']}]({r['official_url']})**\n{r['action']}"
+        for r in rows
+    ]
+
+    await interaction.response.send_message(
+        "🗓️ **Upcoming Tennessee legislative consideration**\n\n"
+        + "\n\n".join(lines)[:3800]
+    )
+
+
+async def retrieve_for_question(question: str):
+    number_match = re.search(r"\b(HB|SB)\s*[- ]?(\d{1,4})\b", question, re.I)
+
+    if number_match:
+        number = f"{number_match.group(1).upper()}{int(number_match.group(2)):04d}"
+        rows = await bot.db.fetch(
+            """
+            SELECT *
+            FROM bills
+            WHERE bill_number=$1
+            ORDER BY general_assembly DESC
+            LIMIT 2
+            """,
+            number,
+        )
+    else:
+        rows = await bot.db.fetch(
+            """
+            WITH q AS (
+                SELECT websearch_to_tsquery('english', $1) AS query
+            )
+            SELECT b.*
+            FROM bills b, q
+            WHERE
+                to_tsvector(
+                    'english',
+                    COALESCE(b.bill_number,'') || ' ' ||
+                    COALESCE(b.caption,'') || ' ' ||
+                    COALESCE(b.page_text,'')
+                ) @@ q.query
+            ORDER BY
+                ts_rank_cd(
+                    to_tsvector(
+                        'english',
+                        COALESCE(b.bill_number,'') || ' ' ||
+                        COALESCE(b.caption,'') || ' ' ||
+                        COALESCE(b.page_text,'')
+                    ),
+                    q.query
+                ) DESC,
+                b.latest_action_date DESC NULLS LAST
+            LIMIT 8
+            """,
+            question,
+        )
+
+    records = []
+    for row in rows:
+        events = await bot.db.fetch(
+            """
+            SELECT action, action_date_text, category
+            FROM bill_events
+            WHERE bill_id=$1
+            ORDER BY action_date DESC NULLS LAST, id DESC
+            LIMIT 10
+            """,
+            row["id"],
+        )
+        records.append((row, events))
+
+    return records
+
+
+@bot.tree.command(
+    name="ask",
+    description="Ask a sourced question about Tennessee legislation.",
+)
+@app_commands.describe(question="Ask about a bill, topic, vote, status, or legislative action")
+async def ask(interaction: discord.Interaction, question: str):
+    await interaction.response.defer(thinking=True)
+
+    if bot.ai is None:
+        await interaction.followup.send(
+            "The research assistant is not configured yet. "
+            "Add OPENAI_API_KEY to the TTI Railway service."
+        )
+        return
+
+    records = await retrieve_for_question(question)
+
+    if not records:
+        await interaction.followup.send(
+            "I couldn't find enough matching official Tennessee legislative records "
+            "in the TTI database to answer that reliably."
+        )
+        return
+
+    context_parts = []
+    source_lines = []
+
+    for row, events in records:
+        context_parts.append(
+            "\n".join(
+                [
+                    f"BILL: {row['bill_number']}",
+                    f"GENERAL ASSEMBLY: {row['general_assembly']}",
+                    f"CAPTION: {row['caption'] or 'Not available'}",
+                    f"LATEST ACTION: {row['latest_action'] or 'Not available'}",
+                    "RECENT OFFICIAL HISTORY:",
+                    *[
+                        f"- {e['action_date_text']}: {e['action']}"
+                        for e in events
+                    ],
+                    f"OFFICIAL URL: {row['official_url']}",
+                ]
+            )
+        )
+        source_lines.append(
+            f"[{row['bill_number']}]({row['official_url']})"
+        )
+
+    system_prompt = """
+You are the research assistant for The Tennessee Independent Legislative Desk.
+
+Answer ONLY from the official Tennessee General Assembly records supplied in
+the context. Do not fill gaps from memory. If the records are insufficient,
+say exactly what cannot be verified.
+
+Be plainspoken and concise. Distinguish:
+- a bill being filed
+- being scheduled
+- passing one chamber
+- passing both chambers
+- transmission to the governor
+- signature
+- veto
+- return without signature
+- enactment/public chapter
+
+When describing a factual legislative action, identify the bill number.
+Do not invent vote totals, dates, sponsors, motives, or legal effects.
+"""
+
+    user_prompt = (
+        f"QUESTION:\n{question}\n\n"
+        f"OFFICIAL TENNESSEE RECORDS:\n\n"
+        + "\n\n---\n\n".join(context_parts)
+    )
+
+    try:
+        response = await bot.ai.responses.create(
+            model=AI_MODEL,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        answer = response.output_text.strip()
+    except Exception:
+        log.exception("AI question answering failed.")
+        await interaction.followup.send(
+            "The official-record search worked, but the AI explanation failed. "
+            "Check the Railway logs."
+        )
+        return
+
+    if len(answer) > 3300:
+        answer = answer[:3297] + "..."
+
+    sources = " • ".join(dict.fromkeys(source_lines))
+    await interaction.followup.send(
+        f"{answer}\n\n**Official Tennessee sources:** {sources}"[:4000]
+    )
+
+
+@bot.tree.command(
+    name="scan",
+    description="Run the Tennessee legislative watcher now.",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def scan(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    result = await run_scan()
+    await interaction.followup.send(
+        f"Scan result: `{result}`",
+        ephemeral=True,
+    )
+
 
 @bot.tree.command(
     name="ping",
     description="Check whether TTI Legislative Desk is online.",
 )
 async def ping(interaction: discord.Interaction):
-    latency_ms = round(bot.latency * 1000)
-
     await interaction.response.send_message(
-        f"🟢 **TTI Legislative Desk is online.**\n"
-        f"Discord latency: `{latency_ms} ms`"
+        f"🟢 TTI Legislative Desk is online. `{round(bot.latency * 1000)} ms`"
     )
 
-
-# ---------------------------------------------------------
-# /dbtest
-# ---------------------------------------------------------
-
-@bot.tree.command(
-    name="dbtest",
-    description="Check the connection to the TTI legislative database.",
-)
-async def dbtest(interaction: discord.Interaction):
-    try:
-        async with bot.db.acquire() as connection:
-            database_time = await connection.fetchval(
-                "SELECT NOW();"
-            )
-
-            bill_count = await connection.fetchval(
-                "SELECT COUNT(*) FROM bills;"
-            )
-
-        await interaction.response.send_message(
-            "🟢 **PostgreSQL connection successful.**\n"
-            f"Database time: `{database_time}`\n"
-            f"Bills currently stored: `{bill_count}`"
-        )
-
-    except Exception as exc:
-        log.exception("Database test failed.")
-
-        await interaction.response.send_message(
-            f"🔴 **Database connection failed.**\n"
-            f"`{type(exc).__name__}`",
-            ephemeral=True,
-        )
-
-
-# ---------------------------------------------------------
-# /bill
-# ---------------------------------------------------------
-
-@bot.tree.command(
-    name="bill",
-    description="Look up a Tennessee bill in the TTI database.",
-)
-@app_commands.describe(
-    bill_number="Bill number, such as HB1882 or SB1649"
-)
-async def bill(
-    interaction: discord.Interaction,
-    bill_number: str,
-):
-    normalized = (
-        bill_number
-        .upper()
-        .replace(" ", "")
-        .replace("-", "")
-    )
-
-    async with bot.db.acquire() as connection:
-        record = await connection.fetchrow(
-            """
-            SELECT
-                general_assembly,
-                bill_number,
-                title,
-                caption,
-                status,
-                official_url,
-                last_action,
-                last_action_date
-            FROM bills
-            WHERE UPPER(REPLACE(bill_number, ' ', '')) = $1
-            ORDER BY general_assembly DESC
-            LIMIT 1;
-            """,
-            normalized,
-        )
-
-    if not record:
-        await interaction.response.send_message(
-            f"🔎 **{normalized}** isn't in the TTI database yet.\n\n"
-            "That's expected right now. The Tennessee legislative "
-            "collector hasn't been connected yet."
-        )
-        return
-
-    embed = discord.Embed(
-        title=record["bill_number"],
-        description=record["caption"] or record["title"] or "No description available.",
-    )
-
-    embed.add_field(
-        name="General Assembly",
-        value=str(record["general_assembly"]),
-        inline=True,
-    )
-
-    embed.add_field(
-        name="Status",
-        value=record["status"] or "Unknown",
-        inline=True,
-    )
-
-    if record["last_action"]:
-        embed.add_field(
-            name="Latest Official Action",
-            value=record["last_action"],
-            inline=False,
-        )
-
-    if record["last_action_date"]:
-        embed.add_field(
-            name="Action Date",
-            value=record["last_action_date"].strftime("%B %d, %Y"),
-            inline=False,
-        )
-
-    if record["official_url"]:
-        embed.add_field(
-            name="Official Tennessee Record",
-            value=f"[View source]({record['official_url']})",
-            inline=False,
-        )
-
-    embed.set_footer(
-        text="The Tennessee Independent • Legislative Desk"
-    )
-
-    await interaction.response.send_message(embed=embed)
-
-# ---------------------------------------------------------
-# /syncbill
-# ---------------------------------------------------------
-
-@bot.tree.command(
-    name="syncbill",
-    description="Import or update a bill from the official Tennessee General Assembly.",
-)
-@app_commands.describe(
-    bill_number="Example: HB1882 or SB1649",
-    general_assembly="Tennessee General Assembly number",
-)
-async def syncbill_command(
-    interaction: discord.Interaction,
-    bill_number: str,
-    general_assembly: int = 114,
-):
-    await interaction.response.defer(
-        thinking=True
-    )
-
-    try:
-        result = await sync_bill(
-            bot.db,
-            bill_number,
-            general_assembly,
-        )
-
-        embed = discord.Embed(
-            title=f"✅ {result['bill_number']} synced",
-            description=(
-                result["caption"]
-                or "Official bill record imported."
-            ),
-        )
-
-        embed.add_field(
-            name="General Assembly",
-            value=str(
-                result["general_assembly"]
-            ),
-            inline=True,
-        )
-
-        embed.add_field(
-            name="History Events",
-            value=str(
-                result["history_count"]
-            ),
-            inline=True,
-        )
-
-        embed.add_field(
-            name="New Events Added",
-            value=str(
-                result["new_events"]
-            ),
-            inline=True,
-        )
-
-        embed.add_field(
-            name="Latest Official Action",
-            value=result["latest_action"],
-            inline=False,
-        )
-
-        embed.add_field(
-            name="Action Date",
-            value=result[
-                "latest_action_date"
-            ],
-            inline=True,
-        )
-
-        embed.add_field(
-            name="Official Source",
-            value=(
-                f"[Tennessee General Assembly]"
-                f"({result['official_url']})"
-            ),
-            inline=False,
-        )
-
-        embed.set_footer(
-            text=(
-                "The Tennessee Independent "
-                "• Legislative Desk"
-            )
-        )
-
-        await interaction.followup.send(
-            embed=embed
-        )
-
-    except ValueError as exc:
-        await interaction.followup.send(
-            f"⚠️ {exc}",
-            ephemeral=True,
-        )
-
-    except Exception:
-        log.exception(
-            "Bill synchronization failed."
-        )
-
-        await interaction.followup.send(
-            "🔴 The Tennessee bill sync failed. "
-            "Check the Railway logs for the error.",
-            ephemeral=True,
-        )
-
-# ---------------------------------------------------------
-# Run
-# ---------------------------------------------------------
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
