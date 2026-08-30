@@ -35,7 +35,9 @@ AI_MODEL = os.getenv("AI_MODEL", "gpt-5.6-luna")
 # A rolling sweep of the official Tennessee site.
 # 1,000 bills per cycle means a full 5,000-6,000 bill session is normally
 # rechecked roughly every 30-40 minutes without hammering the state site.
-BILLS_PER_CYCLE = int(os.getenv("BILLS_PER_CYCLE", "500"))
+BILLS_PER_CYCLE = 60
+CURRENT_REFRESH_BATCH = 40
+HISTORY_BACKFILL_BATCH = 20
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS guild_config (
