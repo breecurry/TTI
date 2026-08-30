@@ -12,7 +12,9 @@ from openai import AsyncOpenAI
 
 from tn_legislation import (
     BillEvent,
-    discover_current_bills,
+    CURRENT_GA,
+    TRACKED_GAS,
+    discover_bills_for_ga,
     fetch_bill,
     new_client,
     normalize_bill_number,
