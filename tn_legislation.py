@@ -9,7 +9,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 
-ARCHIVE_URL = "https://wapp.capitol.tn.gov/apps/archives/default.aspx"
+ARCHIVE_URL = "https://wapp.capitol.tn.gov/apps/Indexes/BillsByIndex"
 BASE_URL = "https://wapp.capitol.tn.gov"
 USER_AGENT = (
     "The Tennessee Independent Legislative Desk/1.0 "
@@ -34,6 +34,277 @@ class BillEvent:
     event_key: str
 
 
+@dataclass
+class BillPage:
+    bill_number: str
+    general_assembly: int
+    official_url: str
+    caption: str | None
+    page_text: str
+    latest_action: str | None
+    latest_action_date: date | None
+    events: list[BillEvent]
+
+
+def normalize_bill_number(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", value.upper())
+
+
+def parse_date(value: str) -> date | None:
+    try:
+        return datetime.strptime(value.strip(), "%m/%d/%Y").date()
+    except Exception:
+        return None
+
+
+def classify_action(action: str) -> str:
+    text = action.lower()
+
+    if "vetoed by governor" in text:
+        return "VETOED"
+    if "signed by governor" in text:
+        return "SIGNED"
+    if "returned by governor without signature" in text:
+        return "WITHOUT SIGNATURE"
+    if "transmitted to governor" in text:
+        return "TO GOVERNOR"
+    if "public chapter" in text or "pub. ch." in text:
+        return "ENACTED"
+    if "passed senate" in text or "passed h." in text or "passed house" in text:
+        return "PASSED"
+    if "passed on third consideration" in text:
+        return "PASSED"
+    if "placed on" in text and ("calendar" in text or "cal." in text):
+        return "SCHEDULED"
+    if "action def" in text or "deferred" in text:
+        return "DEFERRED"
+    if "adopted am" in text or "amendment adopted" in text:
+        return "AMENDED"
+    if "filed for introduction" in text:
+        return "FILED"
+    return "UPDATE"
+
+
+def event_hash(ga: int, bill_number: str, action: str, action_date_text: str) -> str:
+    raw = f"{ga}|{bill_number}|{action_date_text}|{action}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+async def fetch_html(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    params: dict | None = None,
+) -> tuple[str, str]:
+    last_error = None
+
+    for attempt in range(4):
+        try:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            return response.text, str(response.url)
+        except Exception as exc:
+            last_error = exc
+            await asyncio.sleep(1.5 * (attempt + 1))
+
+    raise last_error
+
+
+async def discover_current_bills(
+    client: httpx.AsyncClient,
+) -> tuple[int, dict[str, str]]:
+    """Discover every regular-session House and Senate bill from the official index.
+
+    Tennessee's archive index already publishes the numeric bill ranges. We use
+    those ranges directly instead of depending on the markup of each intermediate
+    index page, which makes discovery much less brittle.
+    """
+    html, _ = await fetch_html(client, ARCHIVE_URL)
+    soup = BeautifulSoup(html, "html.parser")
+
+    heading_text = " ".join(soup.stripped_strings)
+    match = re.search(
+        r"Legislation\s*-?\s*(\d+)(?:th|st|nd|rd)?\s+General Assembly",
+        heading_text,
+        re.I,
+    )
+    if not match:
+        match = re.search(
+            r"Legislation\s*-?\s*(\d+)(?:th|st|nd|rd)?",
+            heading_text,
+            re.I,
+        )
+
+    if not match:
+        raise RuntimeError(
+            "Could not determine the current Tennessee General Assembly from the official archive."
+        )
+
+    general_assembly = int(match.group(1))
+    bills: dict[str, str] = {}
+
+    # Official archive labels look like HB0001-HB0100 and SB2601-SB2700.
+    # Parse those labels and generate the canonical official BillInfo URLs.
+    range_pattern = re.compile(
+        r"\b(HB|SB)(\d{4})\s*-\s*(?:HB|SB)(\d{4})\b",
+        re.I,
+    )
+
+    for anchor in soup.find_all("a"):
+        label = anchor.get_text(" ", strip=True)
+        range_match = range_pattern.search(label)
+        if not range_match:
+            continue
+
+        prefix = range_match.group(1).upper()
+        start_num = int(range_match.group(2))
+        end_num = int(range_match.group(3))
+
+        if end_num < start_num or end_num - start_num > 500:
+            continue
+
+        for number in range(start_num, end_num + 1):
+            bill_number = f"{prefix}{number:04d}"
+            bills[bill_number] = (
+                "https://wapp.capitol.tn.gov/apps/BillInfo/Default"
+                f"?BillNumber={bill_number}&ga={general_assembly}"
+            )
+
+    if not bills:
+        raise RuntimeError(
+            "The Tennessee archive loaded, but no House or Senate bill ranges were found. "
+            "The official site layout may have changed."
+        )
+
+    return general_assembly, bills
+
+
+def _extract_caption(lines: list[str]) -> str | None:
+    for line in lines:
+        if " - As introduced," in line and len(line) > 40:
+            return line.strip()
+
+    for i, line in enumerate(lines):
+        if line.upper().startswith("AN ACT"):
+            for candidate in lines[i + 1 : i + 10]:
+                if len(candidate) > 40 and not candidate.startswith("HB") and not candidate.startswith("SB"):
+                    return candidate.strip()
+
+    return None
+
+
+def _extract_events(
+    soup: BeautifulSoup,
+    bill_number: str,
+    ga: int,
+) -> list[BillEvent]:
+    events: list[BillEvent] = []
+
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if not rows:
+            continue
+
+        header_cells = rows[0].find_all(["th", "td"])
+        header_values = [
+            normalize_bill_number(c.get_text(" ", strip=True))
+            for c in header_cells
+        ]
+
+        if bill_number not in header_values:
+            continue
+
+        for row in rows[1:]:
+            cells = row.find_all(["th", "td"])
+            if len(cells) < 2:
+                continue
+
+            action = cells[0].get_text(" ", strip=True)
+            action_date_text = cells[1].get_text(" ", strip=True)
+
+            if not action or not DATE_RE.search(action_date_text):
+                continue
+
+            action_date = parse_date(action_date_text)
+
+            scheduled_for = None
+            schedule_match = SCHEDULE_RE.search(action)
+            if schedule_match:
+                scheduled_for = parse_date(schedule_match.group(1))
+
+            events.append(
+                BillEvent(
+                    action=action,
+                    action_date_text=action_date_text,
+                    action_date=action_date,
+                    scheduled_for=scheduled_for,
+                    category=classify_action(action),
+                    event_key=event_hash(
+                        ga,
+                        bill_number,
+                        action,
+                        action_date_text,
+                    ),
+                )
+            )
+
+        if events:
+            break
+
+    return events
+
+
+async def fetch_bill(
+    client: httpx.AsyncClient,
+    bill_number: str,
+    ga: int,
+    official_url: str | None = None,
+) -> BillPage:
+    bill_number = normalize_bill_number(bill_number)
+
+    if not BILL_RE.fullmatch(bill_number):
+        raise ValueError("Use a Tennessee bill number such as HB1882 or SB1649.")
+
+    if official_url:
+        html, final_url = await fetch_html(client, official_url)
+    else:
+        html, final_url = await fetch_html(
+            client,
+            "https://wapp.capitol.tn.gov/apps/BillInfo/Default",
+            params={"BillNumber": bill_number, "ga": ga},
+        )
+
+    soup = BeautifulSoup(html, "html.parser")
+    lines = [x.strip() for x in soup.stripped_strings if x.strip()]
+    events = _extract_events(soup, bill_number, ga)
+
+    caption = _extract_caption(lines)
+    page_text = "\n".join(lines)
+    if len(page_text) > 60000:
+        page_text = page_text[:60000]
+
+    latest_action = events[0].action if events else None
+    latest_action_date = events[0].action_date if events else None
+
+    return BillPage(
+        bill_number=bill_number,
+        general_assembly=ga,
+        official_url=final_url,
+        caption=caption,
+        page_text=page_text,
+        latest_action=latest_action,
+        latest_action_date=latest_action_date,
+        events=events,
+    )
+
+
+def new_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=35.0,
+        follow_redirects=True,
+        headers={"User-Agent": USER_AGENT},
+        limits=httpx.Limits(max_connections=4, max_keepalive_connections=4),
+    )
 @dataclass
 class BillPage:
     bill_number: str
