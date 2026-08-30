@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS bills (
     id BIGSERIAL PRIMARY KEY,
     general_assembly INTEGER NOT NULL,
     bill_number TEXT NOT NULL,
-    official_url TEXT NOT NULL,
+    official_url TEXT,
     caption TEXT,
     page_text TEXT,
     latest_action TEXT,
@@ -64,17 +64,62 @@ CREATE TABLE IF NOT EXISTS bills (
     UNIQUE (general_assembly, bill_number)
 );
 
+ALTER TABLE bills
+ADD COLUMN IF NOT EXISTS page_text TEXT;
+
+ALTER TABLE bills
+ADD COLUMN IF NOT EXISTS seeded BOOLEAN NOT NULL DEFAULT FALSE;
+
+ALTER TABLE bills
+ADD COLUMN IF NOT EXISTS discovered_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+ALTER TABLE bills
+ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ;
+
+ALTER TABLE bills
+ADD COLUMN IF NOT EXISTS latest_action TEXT;
+
+ALTER TABLE bills
+ADD COLUMN IF NOT EXISTS latest_action_date DATE;
+
+ALTER TABLE bills
+ADD COLUMN IF NOT EXISTS caption TEXT;
+
+ALTER TABLE bills
+ADD COLUMN IF NOT EXISTS official_url TEXT;
+
+ALTER TABLE bills
+ALTER COLUMN last_action_date
+TYPE DATE
+USING last_action_date::date;
+
+
 CREATE TABLE IF NOT EXISTS bill_events (
     id BIGSERIAL PRIMARY KEY,
     bill_id BIGINT NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
     event_key TEXT NOT NULL UNIQUE,
     action TEXT NOT NULL,
-    action_date_text TEXT NOT NULL,
+    action_date_text TEXT,
     action_date DATE,
     scheduled_for DATE,
-    category TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'UPDATE',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE bill_events
+ADD COLUMN IF NOT EXISTS action_date_text TEXT;
+
+ALTER TABLE bill_events
+ADD COLUMN IF NOT EXISTS scheduled_for DATE;
+
+ALTER TABLE bill_events
+ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'UPDATE';
+
+ALTER TABLE bill_events
+ALTER COLUMN action_date
+TYPE DATE
+USING action_date::date;
+
 
 CREATE INDEX IF NOT EXISTS idx_bills_ga_number
 ON bills (general_assembly, bill_number);
