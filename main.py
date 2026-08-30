@@ -7,6 +7,7 @@ import asyncpg
 import discord
 from discord import app_commands
 from discord.ext import commands
+from collector import sync_bill
 
 
 # ---------------------------------------------------------
@@ -312,6 +313,116 @@ async def bill(
 
     await interaction.response.send_message(embed=embed)
 
+# ---------------------------------------------------------
+# /syncbill
+# ---------------------------------------------------------
+
+@bot.tree.command(
+    name="syncbill",
+    description="Import or update a bill from the official Tennessee General Assembly.",
+)
+@app_commands.describe(
+    bill_number="Example: HB1882 or SB1649",
+    general_assembly="Tennessee General Assembly number",
+)
+async def syncbill_command(
+    interaction: discord.Interaction,
+    bill_number: str,
+    general_assembly: int = 114,
+):
+    await interaction.response.defer(
+        thinking=True
+    )
+
+    try:
+        result = await sync_bill(
+            bot.db,
+            bill_number,
+            general_assembly,
+        )
+
+        embed = discord.Embed(
+            title=f"✅ {result['bill_number']} synced",
+            description=(
+                result["caption"]
+                or "Official bill record imported."
+            ),
+        )
+
+        embed.add_field(
+            name="General Assembly",
+            value=str(
+                result["general_assembly"]
+            ),
+            inline=True,
+        )
+
+        embed.add_field(
+            name="History Events",
+            value=str(
+                result["history_count"]
+            ),
+            inline=True,
+        )
+
+        embed.add_field(
+            name="New Events Added",
+            value=str(
+                result["new_events"]
+            ),
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Latest Official Action",
+            value=result["latest_action"],
+            inline=False,
+        )
+
+        embed.add_field(
+            name="Action Date",
+            value=result[
+                "latest_action_date"
+            ],
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Official Source",
+            value=(
+                f"[Tennessee General Assembly]"
+                f"({result['official_url']})"
+            ),
+            inline=False,
+        )
+
+        embed.set_footer(
+            text=(
+                "The Tennessee Independent "
+                "• Legislative Desk"
+            )
+        )
+
+        await interaction.followup.send(
+            embed=embed
+        )
+
+    except ValueError as exc:
+        await interaction.followup.send(
+            f"⚠️ {exc}",
+            ephemeral=True,
+        )
+
+    except Exception:
+        log.exception(
+            "Bill synchronization failed."
+        )
+
+        await interaction.followup.send(
+            "🔴 The Tennessee bill sync failed. "
+            "Check the Railway logs for the error.",
+            ephemeral=True,
+        )
 
 # ---------------------------------------------------------
 # Run
