@@ -782,7 +782,7 @@ async def run_scan():
 
             return result
 
-@tasks.loop(minutes=5)
+@tasks.loop(seconds=60)
 async def legislative_watch():
     try:
         result = await run_scan()
@@ -1236,64 +1236,68 @@ Do not invent vote totals, dates, sponsors, motives, or legal effects.
 
 @bot.tree.command(
     name="scan",
-    description="Check Tennessee's official legislative index now.",
+    description="Start one Tennessee legislative batch now.",
 )
-@app_commands.checks.has_permissions(manage_guild=True)
-async def scan(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True, ephemeral=True)
+@app_commands.checks.has_permissions(
+    manage_guild=True
+)
+async def scan(
+    interaction: discord.Interaction
+):
 
-    try:
-        result = await run_scan()
-    except Exception as exc:
-        log.exception("Manual Tennessee legislative scan failed.")
-        await interaction.followup.send(
-            "🔴 **The Tennessee scan failed.**\n"
-            f"`{type(exc).__name__}: {exc}`",
+    # The background watcher may already be doing exactly
+    # what the user just requested.
+    if bot.scan_lock.locked():
+
+        current_ga = CURRENT_GA
+
+        total = await bot.db.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM bills
+            WHERE general_assembly=$1
+            """,
+            current_ga,
+        )
+
+        indexed = await bot.db.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM bills
+            WHERE
+                general_assembly=$1
+                AND seeded=TRUE
+            """,
+            current_ga,
+        )
+
+        await interaction.response.send_message(
+            "🔄 **A Tennessee legislative batch is "
+            "currently running.**\n\n"
+            f"Current legislature indexed: "
+            f"**{indexed:,} / {total:,} bills**\n\n"
+            "The bot processes the database in small batches "
+            "automatically. You do not need to keep running "
+            "`/scan`.",
             ephemeral=True,
         )
+
         return
 
-    if result.get("status") == "already running":
-        await interaction.followup.send(
-            "⏳ A Tennessee legislative scan is already running.",
-            ephemeral=True,
-        )
-        return
+    # Do NOT make Discord sit waiting for the entire batch.
+    # Start it in the background and answer immediately.
 
-    general_assembly = result["general_assembly"]
-    embed = discord.Embed(
-        title="✅ Tennessee legislative scan finished",
-        description=f"**{general_assembly}th General Assembly (2025–2026)**",
+    asyncio.create_task(
+        run_scan()
     )
-    embed.add_field(
-        name="Bills found on official index",
-        value=f"{result['discovered']:,}",
-        inline=True,
+
+    await interaction.response.send_message(
+        "✅ **Legislative batch started.**\n\n"
+        f"Processing up to **{BILLS_PER_CYCLE} bills** "
+        "in this batch. The automatic watcher will continue "
+        "with the next batch.",
+        ephemeral=True,
     )
-    embed.add_field(
-        name="Indexed so far",
-        value=f"{result['indexed']:,}",
-        inline=True,
-    )
-    embed.add_field(
-        name="Checked this run",
-        value=f"{result['checked_this_run']:,}",
-        inline=True,
-    )
-    embed.add_field(
-        name="Still to index",
-        value=f"{result['remaining']:,}",
-        inline=True,
-    )
-    embed.add_field(
-        name="Initial index",
-        value="✅ Complete" if result["baseline_complete"] else "⏳ Building",
-        inline=True,
-    )
-    embed.set_footer(
-        text="Official source: Tennessee General Assembly"
-    )
-    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(
